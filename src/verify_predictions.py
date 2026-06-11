@@ -23,6 +23,9 @@ verify_predictions.py  （滾動更新版 v3）
   【賽後：輸入比分，自動更新模型狀態並重算後續預測】
   python src/verify_predictions.py --verify
 
+  【賠率 vs 模型對比（需設定 BSD_API_KEY）】
+  python src/verify_predictions.py --odds
+
   【查看累計準確率】
   python src/verify_predictions.py --stats
 
@@ -36,6 +39,11 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from scipy.stats import poisson as scipy_poisson
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 # ── 路徑設定 ─────────────────────────────────────────────────────
 XGB_PATH      = r"data/models/xgb_v2.pkl"
@@ -46,6 +54,20 @@ ELO_PATH      = r"data/processed/wc26_elo_v2.csv"
 H2H_PATH      = r"data/processed/wc26_h2h.csv"
 PRED_LOG      = r"data/processed/wc2026_predictions.csv"
 LIVE_STATE    = r"data/processed/wc2026_live_state.csv"   # 滾動狀態存檔
+ODDS_EXCEL    = r"data/reports/wc2026_odds_comparison.xlsx"  # 賠率比較輸出
+
+# BSD API 設定
+BSD_API_KEY       = ""          # ← 填入你的 BSD API key
+BSD_BASE          = "https://sports.bzzoiro.com"
+BSD_WC_LEAGUE_ID  = 27          # World Cup 2026
+BSD_VALUE_BET_THR = 0.05        # Value Bet 閾值（模型 - 市場 > 5%）
+BSD_NAME_MAP = {                # BSD 隊名 → 我們的隊名
+    "Czechia":       "Czech Republic",
+    "Türkiye":       "Turkey",
+    "Côte d'Ivoire": "Ivory Coast",
+    "Cabo Verde":    "Cape Verde",
+    "USA":           "United States",
+}
 # ─────────────────────────────────────────────────────────────────
 
 WC_GOAL_SCALE = 1.35   # 世界盃進球校正係數
@@ -446,6 +468,274 @@ def predict_match(home, away, group, xgb_data, poi_data, ens_data, feat, state, 
     }
 
 
+
+# ════════════════════════════════════════════════════════════════
+# BSD 賠率整合
+# ════════════════════════════════════════════════════════════════
+
+def _fetch_bsd_events() -> list:
+    """從 BSD API 拉取 WC 比賽資料（含賠率）"""
+    if not HAS_REQUESTS:
+        print("  ⚠️  未安裝 requests，跳過賠率拉取")
+        return []
+    if not BSD_API_KEY:
+        print("  ⚠️  BSD_API_KEY 未設定，跳過賠率拉取")
+        return []
+    headers = {"Authorization": f"Token {BSD_API_KEY}"}
+    all_events, url = [], f"{BSD_BASE}/api/events/"
+    params = {"league": BSD_WC_LEAGUE_ID, "limit": 100}
+    while url:
+        try:
+            r = _requests.get(url, headers=headers, params=params, timeout=10)
+            if r.status_code != 200:
+                print(f"  ⚠️  BSD API {r.status_code}")
+                break
+            data = r.json()
+            all_events.extend(data.get("results", []))
+            url, params = data.get("next"), {}
+        except Exception as e:
+            print(f"  ⚠️  BSD 連線失敗：{e}")
+            break
+    return all_events
+
+
+def _bsd_implied_prob(odds_h, odds_d, odds_a):
+    """decimal 賠率 → 去水份隱含機率（%）"""
+    try:
+        rh, rd, ra = 1/float(odds_h), 1/float(odds_d), 1/float(odds_a)
+        t = rh + rd + ra
+        return round(rh/t*100,1), round(rd/t*100,1), round(ra/t*100,1)
+    except (TypeError, ZeroDivisionError, ValueError):
+        return None, None, None
+
+
+def _bsd_vig(odds_h, odds_d, odds_a):
+    try:
+        return round((1/float(odds_h)+1/float(odds_d)+1/float(odds_a)-1)*100, 2)
+    except (TypeError, ZeroDivisionError, ValueError):
+        return None
+
+
+def cmd_odds(tw_date_filter=None, export=True):
+    """
+    拉取 BSD 賠率，與模型預測比對，顯示並可輸出 Excel。
+    --odds           今天（台灣時間）的賠率 vs 模型
+    --odds --date X  指定台灣日期
+    --odds --export  同時輸出 Excel（預設開啟）
+    """
+    target = tw_date_filter or (datetime.now(timezone.utc)+timedelta(hours=8)).strftime("%Y-%m-%d")
+
+    print(f"\n📡 拉取 BSD 賠率（World Cup 2026）...")
+    events = _fetch_bsd_events()
+    if not events:
+        print("  無法取得賠率資料"); return
+
+    # 轉成 dict，key=(home_mapped, away_mapped)
+    bsd_map = {}
+    for e in events:
+        h = BSD_NAME_MAP.get(e["home_team"], e["home_team"])
+        a = BSD_NAME_MAP.get(e["away_team"], e["away_team"])
+        bsd_map[(h, a)] = e
+
+    # 讀模型預測
+    pred_log = Path(PRED_LOG)
+    pred_df  = pd.read_csv(PRED_LOG) if pred_log.exists() else pd.DataFrame()
+
+    # 篩今天的比賽
+    fixtures_today = [f for f in WC2026_FIXTURES if f["tw_date"] == target]
+    if not fixtures_today:
+        print(f"  台灣時間 {target} 沒有分組賽")
+        return
+
+    print(f"\n{'='*65}")
+    print(f"  賠率 vs 模型  │  台灣時間 {target}")
+    print(f"  【市場機率】來自去水份後的 BSD 賠率隱含機率")
+    print(f"  【模型機率】來自 XGBoost + Poisson Ensemble")
+    print(f"  【Value Bet🔥】模型機率 > 市場機率 ≥ {BSD_VALUE_BET_THR*100:.0f}%")
+    print(f"{'='*65}")
+
+    rows_out = []
+    for fix in sorted(fixtures_today, key=lambda x: x["tw_time"]):
+        home, away = fix["home"], fix["away"]
+        e = bsd_map.get((home, away))
+
+        # 賠率
+        if e and e.get("odds_home"):
+            odds_h, odds_d, odds_a = e["odds_home"], e["odds_draw"], e["odds_away"]
+            mkt_h, mkt_d, mkt_a   = _bsd_implied_prob(odds_h, odds_d, odds_a)
+            vig                    = _bsd_vig(odds_h, odds_d, odds_a)
+            odds_str = f"H={odds_h}  D={odds_d}  A={odds_a}  (水份{vig}%)"
+            mkt_str  = f"主場勝 {mkt_h}%  平局 {mkt_d}%  客場勝 {mkt_a}%"
+        else:
+            odds_h = odds_d = odds_a = None
+            mkt_h = mkt_d = mkt_a = vig = None
+            odds_str = "（無賠率）"
+            mkt_str  = ""
+
+        # 模型預測
+        pred_row = None
+        if not pred_df.empty:
+            m = pred_df[(pred_df["home"]==home) & (pred_df["away"]==away)]
+            if not m.empty:
+                pred_row = m.iloc[0]
+
+        print(f"\n  {fix['tw_time']}  Group {fix['group']}  {home} vs {away}")
+
+        # 實際比分（已知的話顯示）
+        if pred_row is not None and str(pred_row.get("actual_result","")).strip() in ("H","D","A"):
+            result_icon = "✅" if pred_row["correct"] else "❌"
+            print(f"  實際結果 ▶ {int(pred_row['actual_home_score'])}-{int(pred_row['actual_away_score'])}  {result_icon}")
+
+        if odds_str != "（無賠率）":
+            print(f"  ── 賠率  ──  {odds_str}")
+            print(f"  ── 市場  ──  {mkt_str}")
+
+        if pred_row is not None:
+            p_h = float(pred_row["p_home"])
+            p_d = float(pred_row["p_draw"])
+            p_a = float(pred_row["p_away"])
+            winner = home if pred_row["pred_result"]=="H" else ("平局" if pred_row["pred_result"]=="D" else away)
+            print(f"  ── 模型  ──  主場勝 {p_h}%  平局 {p_d}%  客場勝 {p_a}%  → {winner}")
+            print(f"  ── 比分  ──  #{1} {int(pred_row['pred_home_goals'])}-{int(pred_row['pred_away_goals'])}({pred_row['score1_prob']}%)"
+                  f"  #{2} {int(pred_row['score2_home'])}-{int(pred_row['score2_away'])}({pred_row['score2_prob']}%)"
+                  f"  #{3} {int(pred_row['score3_home'])}-{int(pred_row['score3_away'])}({pred_row['score3_prob']}%)")
+
+            # Value Bet 偵測
+            vb_hits = []
+            if mkt_h:
+                for label, mp, mkp in [("主場勝",p_h,mkt_h),("平局",p_d,mkt_d),("客場勝",p_a,mkt_a)]:
+                    if mp and mkp and (mp - mkp) >= BSD_VALUE_BET_THR*100:
+                        vb_hits.append(f"{label} +{mp-mkp:.1f}%")
+            if vb_hits:
+                print(f"  🔥 Value Bet ▶ {'  '.join(vb_hits)}")
+
+            # 差值
+            if mkt_h:
+                diffs = [f"主場{p_h-mkt_h:+.1f}%", f"平局{p_d-mkt_d:+.1f}%", f"客場{p_a-mkt_a:+.1f}%"]
+                print(f"  ── 差值  ──  {'  '.join(diffs)}  （模型 - 市場，正=模型更看好）")
+
+        # 收集輸出資料
+        rows_out.append({
+            "台灣日期": fix["tw_date"], "台灣時間": fix["tw_time"],
+            "組別": fix["group"], "主隊": home, "客隊": away,
+            # 賠率
+            "主場賠率": odds_h, "平局賠率": odds_d, "客場賠率": odds_a,
+            "大球(>2.5)": e.get("odds_over_25") if e else None,
+            "小球(<2.5)": e.get("odds_under_25") if e else None,
+            "雙隊進球": e.get("odds_btts_yes") if e else None,
+            "莊家水份%": vig,
+            # 市場機率
+            "市場主場勝%": mkt_h, "市場平局%": mkt_d, "市場客場勝%": mkt_a,
+            # 模型機率
+            "模型主場勝%": pred_row["p_home"] if pred_row is not None else None,
+            "模型平局%":   pred_row["p_draw"] if pred_row is not None else None,
+            "模型客場勝%": pred_row["p_away"] if pred_row is not None else None,
+            # 差值
+            "差值主場%": round(float(pred_row["p_home"])-mkt_h,1) if pred_row is not None and mkt_h else None,
+            "差值平局%": round(float(pred_row["p_draw"])-mkt_d,1) if pred_row is not None and mkt_d else None,
+            "差值客場%": round(float(pred_row["p_away"])-mkt_a,1) if pred_row is not None and mkt_a else None,
+            # 模型預測
+            "模型預測": pred_row["pred_result"] if pred_row is not None else None,
+            "預測主隊進球": int(pred_row["pred_home_goals"]) if pred_row is not None else None,
+            "預測客隊進球": int(pred_row["pred_away_goals"]) if pred_row is not None else None,
+            "#1比分機率%": pred_row["score1_prob"] if pred_row is not None else None,
+            "#2比分": f"{int(pred_row['score2_home'])}-{int(pred_row['score2_away'])}" if pred_row is not None else None,
+            "#3比分": f"{int(pred_row['score3_home'])}-{int(pred_row['score3_away'])}" if pred_row is not None else None,
+            "Value Bet": "  ".join(vb_hits) if pred_row is not None and mkt_h else "",
+            # 實際結果
+            "實際比分": f"{int(pred_row['actual_home_score'])}-{int(pred_row['actual_away_score'])}" if pred_row is not None and str(pred_row.get("actual_result","")).strip() in ("H","D","A") else "",
+            "實際結果": pred_row["actual_result"] if pred_row is not None else "",
+            "預測正確": pred_row["correct"] if pred_row is not None else "",
+        })
+
+    # 輸出 Excel
+    if export and rows_out:
+        _export_odds_excel(rows_out, target)
+
+
+def _export_odds_excel(rows, tw_date):
+    """輸出賠率比較 Excel"""
+    Path(ODDS_EXCEL).parent.mkdir(parents=True, exist_ok=True)
+
+    # 若已有舊檔，讀入合併（避免覆蓋其他日期）
+    new_df = pd.DataFrame(rows)
+    if Path(ODDS_EXCEL).exists():
+        try:
+            old_df = pd.read_excel(ODDS_EXCEL)
+            # 移除同日期的舊資料，換成新的
+            old_df = old_df[old_df["台灣日期"] != tw_date]
+            final_df = pd.concat([old_df, new_df], ignore_index=True)
+        except Exception:
+            final_df = new_df
+    else:
+        final_df = new_df
+
+    final_df = final_df.sort_values(["台灣日期","台灣時間"]).reset_index(drop=True)
+
+    try:
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        with pd.ExcelWriter(ODDS_EXCEL, engine="openpyxl") as writer:
+            final_df.to_excel(writer, index=False, sheet_name="賠率比較")
+            ws = writer.sheets["賠率比較"]
+
+            thin   = Side(style="thin", color="BFBFBF")
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            # 標題列
+            for cell in ws[1]:
+                cell.fill      = PatternFill("solid", fgColor="1F4E79")
+                cell.font      = Font(bold=True, color="FFFFFF", size=9, name="Arial")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border    = border
+            ws.row_dimensions[1].height = 28
+
+            col_names = [c.value for c in ws[1]]
+            vb_idx = col_names.index("Value Bet")+1 if "Value Bet" in col_names else None
+            pred_idx = col_names.index("模型預測")+1 if "模型預測" in col_names else None
+
+            fill_vb   = PatternFill("solid", fgColor="FFF3CD")
+            fill_home = PatternFill("solid", fgColor="E8F5E9")
+            fill_away = PatternFill("solid", fgColor="FFF3E0")
+            fill_draw = PatternFill("solid", fgColor="F3F3F3")
+            fill_even = PatternFill("solid", fgColor="F5F8FF")
+
+            for row_idx in range(2, ws.max_row+1):
+                vb_val   = ws.cell(row=row_idx, column=vb_idx).value  if vb_idx   else ""
+                pred_val = ws.cell(row=row_idx, column=pred_idx).value if pred_idx else ""
+                if vb_val:
+                    rf = fill_vb
+                elif pred_val == "H":
+                    rf = fill_home
+                elif pred_val == "A":
+                    rf = fill_away
+                elif pred_val == "D":
+                    rf = fill_draw
+                else:
+                    rf = fill_even if row_idx % 2 == 0 else None
+
+                for cell in ws[row_idx]:
+                    cell.border    = border
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.font      = Font(size=9, name="Arial")
+                    if rf: cell.fill = rf
+
+            for i, _ in enumerate(ws.iter_cols(min_row=1, max_row=1), 1):
+                ws.column_dimensions[get_column_letter(i)].width = 11
+            for name, w in [("主隊",16),("客隊",16),("Value Bet",22)]:
+                if name in col_names:
+                    ws.column_dimensions[get_column_letter(col_names.index(name)+1)].width = w
+            ws.freeze_panes = "A2"
+
+        print(f"\n  💾 Excel 已更新：{ODDS_EXCEL}")
+
+    except ImportError:
+        csv_out = ODDS_EXCEL.replace(".xlsx",".csv")
+        final_df.to_csv(csv_out, index=False, encoding="utf-8-sig")
+        print(f"\n  💾 CSV 已儲存：{csv_out}")
+
 # ════════════════════════════════════════════════════════════════
 # 指令函式
 # ════════════════════════════════════════════════════════════════
@@ -528,6 +818,7 @@ def cmd_predict(et_date_filter=None):
     if new_rows:
         log_df = pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True) if not log_df.empty else pd.DataFrame(new_rows)
     if not log_df.empty:
+        log_df = log_df.sort_values(["tw_date","tw_time"]).reset_index(drop=True)
         log_df.to_csv(PRED_LOG, index=False, encoding="utf-8-sig")
         print(f"\n✅ 預測已儲存至 {PRED_LOG}")
 
@@ -550,6 +841,17 @@ def cmd_today(tw_date_filter=None):
     pred_log = Path(PRED_LOG)
     log_df   = pd.read_csv(PRED_LOG) if pred_log.exists() else pd.DataFrame()
 
+    # 一次性拉取賠率（避免每場都呼叫 API）
+    if BSD_API_KEY and HAS_REQUESTS:
+        bsd_events_all = _fetch_bsd_events()
+        nm = BSD_NAME_MAP
+        bsd_map_today = {
+            (nm.get(e["home_team"],e["home_team"]), nm.get(e["away_team"],e["away_team"])): e
+            for e in bsd_events_all
+        }
+    else:
+        bsd_map_today = {}
+
     for fix in sorted(fixtures_today, key=lambda x: x["tw_time"]):
         home, away = fix["home"], fix["away"]
         print(f"\n  {fix['tw_time']}  Group {fix['group']}")
@@ -570,15 +872,96 @@ def cmd_today(tw_date_filter=None):
                 print(f"  比分 ▶ #{1} {int(r['pred_home_goals'])}-{int(r['pred_away_goals'])}({r['score1_prob']}%)"
                       f"  #{2} {int(r['score2_home'])}-{int(r['score2_away'])}({r['score2_prob']}%)"
                       f"  #{3} {int(r['score3_home'])}-{int(r['score3_away'])}({r['score3_prob']}%)")
+                # 賠率快速顯示（bsd_map 在 loop 外已建立，直接用）
+                bsd_e = bsd_map_today.get((home, away)) if bsd_map_today else None
+                if bsd_e and bsd_e.get("odds_home"):
+                    mh,md,ma = _bsd_implied_prob(bsd_e["odds_home"],bsd_e["odds_draw"],bsd_e["odds_away"])
+                    print(f"  賠率 ▶ H={bsd_e['odds_home']} D={bsd_e['odds_draw']} A={bsd_e['odds_away']}  市場機率：{mh}%/{md}%/{ma}%")
             else:
                 print("  （尚未預測，執行 --predict）")
         else:
             print("  （尚未預測，執行 --predict）")
 
 
+def _fetch_bsd_results(target_tw_date: str) -> dict:
+    """
+    從 BSD API 拉取指定台灣日期的 WC 完賽比分。
+    回傳 dict：key=(home_mapped, away_mapped), value=(home_goals, away_goals)
+    只回傳 status=finished 的比賽。
+    """
+    if not HAS_REQUESTS or not BSD_API_KEY:
+        return {}
+    headers = {"Authorization": f"Token {BSD_API_KEY}"}
+    try:
+        r = _requests.get(f"{BSD_BASE}/api/events/",
+                          headers=headers,
+                          params={"league": BSD_WC_LEAGUE_ID, "limit": 100},
+                          timeout=10)
+        if r.status_code != 200:
+            return {}
+        events = r.json().get("results", [])
+    except Exception:
+        return {}
+
+    results = {}
+    for e in events:
+        if e.get("status") != "finished":
+            continue
+        if e.get("home_score") is None or e.get("away_score") is None:
+            continue
+        # 日期轉台灣時間
+        event_dt = e.get("event_date","")
+        try:
+            dt_utc = datetime.fromisoformat(event_dt.replace("Z","+00:00"))
+            dt_tw  = dt_utc.astimezone(timezone(timedelta(hours=8)))
+            event_tw_date = dt_tw.strftime("%Y-%m-%d")
+        except Exception:
+            event_tw_date = event_dt[:10]
+
+        if event_tw_date != target_tw_date:
+            continue
+
+        h = BSD_NAME_MAP.get(e["home_team"], e["home_team"])
+        a = BSD_NAME_MAP.get(e["away_team"], e["away_team"])
+        results[(h, a)] = (int(e["home_score"]), int(e["away_score"]))
+
+    return results
+
+
+def _process_result(df, idx, row, hg, ag, state, source_label):
+    """比分寫入 df + 更新滾動狀態，回傳 (updated_state, elo_changes_str)"""
+    actual_result = "H" if hg > ag else ("D" if hg == ag else "A")
+    correct = (actual_result == row["pred_result"])
+
+    df.at[idx, "actual_home_score"] = hg
+    df.at[idx, "actual_away_score"] = ag
+    df.at[idx, "actual_result"]     = actual_result
+    df.at[idx, "correct"]           = correct
+
+    home, away = row["home"], row["away"]
+    elo_h_before = float(state[state["team"]==home]["elo"].iloc[0]) if not state[state["team"]==home].empty else 1700
+    elo_a_before = float(state[state["team"]==away]["elo"].iloc[0]) if not state[state["team"]==away].empty else 1700
+
+    state = update_live_state(state, home, away, hg, ag, row["group"])
+    save_live_state(state)
+
+    elo_h_after = float(state[state["team"]==home]["elo"].iloc[0])
+    elo_a_after = float(state[state["team"]==away]["elo"].iloc[0])
+
+    status = "✅ 預測正確！" if correct else "❌ 預測錯誤"
+    print(f"  {status}  {source_label}：{hg}-{ag}")
+    print(f"  ELO 更新：{home} {elo_h_before:.0f}→{elo_h_after:.0f}({elo_h_after-elo_h_before:+.0f})"
+          f"  {away} {elo_a_before:.0f}→{elo_a_after:.0f}({elo_a_after-elo_a_before:+.0f})")
+    return state, correct
+
+
 def cmd_verify(tw_date_filter=None):
     """
-    輸入比賽真實比分 → 自動更新 ELO/form/積分 → 重算後續所有預測
+    自動驗證流程：
+    1. 先從 BSD API 拉已完賽的比分（status=finished）
+    2. 有 API 比分 → 自動填入，不需手動
+    3. 沒有 API 比分（比賽未結束）→ 詢問手動輸入
+    4. 有任何更新 → 自動重算後續所有比賽預測
     """
     pred_log = Path(PRED_LOG)
     if not pred_log.exists():
@@ -597,65 +980,65 @@ def cmd_verify(tw_date_filter=None):
             print(f"\n台灣時間 {target} 沒有待驗證的比賽（用 --date 指定日期）")
         cmd_stats(); return
 
+    # ── 先從 BSD 拉已完賽比分 ──────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  驗證台灣時間 {target} 的比賽結果")
+    print(f"{'='*65}")
+
+    if BSD_API_KEY and HAS_REQUESTS:
+        print(f"\n  📡 從 BSD API 拉取已完賽比分...")
+        bsd_results = _fetch_bsd_results(target)
+        auto_count = len(bsd_results)
+        if auto_count:
+            print(f"  ✅ BSD 回傳 {auto_count} 場已完賽比分")
+        else:
+            print(f"  （BSD 目前無已完賽資料，將以手動輸入為主）")
+    else:
+        bsd_results = {}
+
     state = load_live_state()
     updated_any = False
 
-    print(f"\n{'='*65}")
-    print(f"  輸入台灣時間 {target} 的比賽結果")
-    print(f"  格式：主隊得分-客隊得分（例如 2-1）")
-    print(f"  直接按 Enter 可跳過（比賽尚未結束）")
-    print(f"{'='*65}")
-
     for idx, row in unverified.iterrows():
-        print(f"\n  {row['tw_time']}  Group {row['group']}")
-        print(f"  {row['home']:<22} vs  {row['away']}")
-        winner = row["home"] if row["pred_result"]=="H" else ("平局" if row["pred_result"]=="D" else row["away"])
-        print(f"  模型預測 ▶ {winner}  （主場勝 {row['p_home']}% │ 平局 {row['p_draw']}% │ 客場勝 {row['p_away']}%）")
-        print(f"  比分推薦 ▶ #{1} {int(row['pred_home_goals'])}-{int(row['pred_away_goals'])}"
-              f"  #{2} {int(row['score2_home'])}-{int(row['score2_away'])}"
-              f"  #{3} {int(row['score3_home'])}-{int(row['score3_away'])}")
+        home, away = row["home"], row["away"]
+        print(f"\n  {row['tw_time']}  Group {row['group']}  {home} vs {away}")
+        winner = home if row["pred_result"]=="H" else ("平局" if row["pred_result"]=="D" else away)
+        print(f"  模型預測 ▶ {winner}  "
+              f"（主場勝 {row['p_home']}% │ 平局 {row['p_draw']}% │ 客場勝 {row['p_away']}%）")
+        print(f"  比分推薦 ▶ "
+              f"#{1} {int(row['pred_home_goals'])}-{int(row['pred_away_goals'])}  "
+              f"#{2} {int(row['score2_home'])}-{int(row['score2_away'])}  "
+              f"#{3} {int(row['score3_home'])}-{int(row['score3_away'])}")
 
-        score_input = input("  實際比分（Enter 跳過）：").strip()
-        if not score_input:
-            print("  ↩ 跳過"); continue
-
-        try:
-            hg, ag = map(int, score_input.split("-"))
-            actual_result = "H" if hg>ag else ("D" if hg==ag else "A")
-            correct = (actual_result == row["pred_result"])
-
-            df.at[idx,"actual_home_score"] = hg
-            df.at[idx,"actual_away_score"] = ag
-            df.at[idx,"actual_result"]     = actual_result
-            df.at[idx,"correct"]           = correct
-
-            status = "✅ 預測正確！" if correct else "❌ 預測錯誤"
-            elo_h_before = float(state[state["team"]==row["home"]]["elo"].iloc[0]) if not state[state["team"]==row["home"]].empty else 1700
-            elo_a_before = float(state[state["team"]==row["away"]]["elo"].iloc[0]) if not state[state["team"]==row["away"]].empty else 1700
-
-            # 更新滾動狀態
-            state = update_live_state(state, row["home"], row["away"], hg, ag, row["group"])
-            save_live_state(state)
+        # ── 情況一：BSD 有完賽比分 → 自動填入 ──────────────────
+        if (home, away) in bsd_results:
+            hg, ag = bsd_results[(home, away)]
+            print(f"  🤖 BSD 自動取得比分：{hg}-{ag}")
+            state, _ = _process_result(df, idx, row, hg, ag, state, "BSD自動")
             updated_any = True
 
-            elo_h_after = float(state[state["team"]==row["home"]]["elo"].iloc[0])
-            elo_a_after = float(state[state["team"]==row["away"]]["elo"].iloc[0])
-
-            print(f"  {status}  實際：{hg}-{ag}")
-            print(f"  ELO 更新：{row['home']} {elo_h_before:.0f} → {elo_h_after:.0f} ({elo_h_after-elo_h_before:+.0f})")
-            print(f"            {row['away']} {elo_a_before:.0f} → {elo_a_after:.0f} ({elo_a_after-elo_a_before:+.0f})")
-
-        except ValueError:
-            print("  ⚠ 格式錯誤，已跳過")
+        # ── 情況二：無 API 比分 → 手動輸入 ─────────────────────
+        else:
+            print(f"  （BSD 尚無完賽資料）")
+            score_input = input("  手動輸入比分（格式 2-1，Enter 跳過）：").strip()
+            if not score_input:
+                print("  ↩ 跳過（比賽尚未結束）")
+                continue
+            try:
+                hg, ag = map(int, score_input.split("-"))
+                state, _ = _process_result(df, idx, row, hg, ag, state, "手動輸入")
+                updated_any = True
+            except ValueError:
+                print("  ⚠ 格式錯誤，已跳過")
 
     df.to_csv(PRED_LOG, index=False, encoding="utf-8-sig")
 
-    # 如果有更新，重算後續比賽的預測
+    # ── 有更新 → 重算後續預測 ────────────────────────────────
     if updated_any:
-        print(f"\n🔄 正在重算後續比賽的預測（ELO/form 已更新）...")
+        print(f"\n🔄 重算後續比賽預測（ELO/form 已更新）...")
         xgb_data, poi_data, ens_data = load_models()
         feat, h2h_dict = load_features()
-        state = load_live_state()  # 重讀最新狀態
+        state = load_live_state()
 
         done_keys = set(zip(
             df[df["actual_result"].fillna("").str.strip().isin(["H","D","A"])]["home"],
@@ -666,19 +1049,24 @@ def cmd_verify(tw_date_filter=None):
             home, away = fix["home"], fix["away"]
             if (home, away) in done_keys:
                 continue
-            pred = predict_match(home, away, fix["group"], xgb_data, poi_data, ens_data, feat, state, h2h_dict)
+            pred = predict_match(home, away, fix["group"],
+                                 xgb_data, poi_data, ens_data, feat, state, h2h_dict)
             mask2 = (df["home"]==home) & (df["away"]==away)
             if mask2.any():
                 idx2 = df[mask2].index[0]
                 for k in ["p_home","p_draw","p_away","pred_result",
                            "pred_home_goals","pred_away_goals","score1_prob",
                            "score2_home","score2_away","score2_prob",
-                           "score3_home","score3_away","score3_prob","home_elo","away_elo"]:
+                           "score3_home","score3_away","score3_prob",
+                           "home_elo","away_elo"]:
                     df.at[idx2, k] = pred[k]
             recalc_count += 1
 
+        df = df.sort_values(["tw_date","tw_time"]).reset_index(drop=True)
         df.to_csv(PRED_LOG, index=False, encoding="utf-8-sig")
-        print(f"  ✅ {recalc_count} 場後續比賽預測已更新")
+        print(f"  ✅ {recalc_count} 場後續預測已自動更新")
+    else:
+        print(f"\n  沒有新的比賽結果，預測維持不變")
 
     cmd_stats()
 
@@ -705,12 +1093,14 @@ def cmd_stats():
     print(f"  已驗證：{total} 場  │  正確：{correct} 場  │  準確率：{correct/total*100:.1f}%")
 
     print(f"\n  ── 各日明細 ──")
-    for tw_date, grp in verified.groupby("tw_date"):
+    verified_sorted = verified.sort_values(["tw_date","tw_time"]).reset_index(drop=True)
+    for tw_date, grp in verified_sorted.groupby("tw_date", sort=False):
         dc = int(grp["correct"].sum())
         print(f"\n  {tw_date}  {dc}/{len(grp)} 場正確")
-        for _, r in grp.iterrows():
+        for _, r in grp.sort_values("tw_time").iterrows():
             st = "✅" if r["correct"] else "❌"
-            print(f"    {st} {r['home']:<20} {int(r['actual_home_score'])}-{int(r['actual_away_score'])} {r['away']:<20}  (預測 {r['pred_result']})")
+            tw_time = r.get("tw_time","")
+            print(f"    {st} {tw_time}  {r['home']:<20} {int(r['actual_home_score'])}-{int(r['actual_away_score'])} {r['away']:<20}  (預測 {r['pred_result']})")
 
     print(f"\n  ── 各結果類型 ──")
     for res, label in [("H","主場勝"),("D","平局"),("A","客場勝")]:
@@ -771,6 +1161,7 @@ if __name__ == "__main__":
     parser.add_argument("--predict",    action="store_true", help="產出所有預測（使用最新滾動狀態）")
     parser.add_argument("--today",      action="store_true", help="查看今天台灣時間的比賽")
     parser.add_argument("--verify",     action="store_true", help="輸入比分並更新後續預測")
+    parser.add_argument("--odds",       action="store_true", help="拉取 BSD 賠率並與模型比對（輸出 Excel）")
     parser.add_argument("--stats",      action="store_true", help="查看準確率統計")
     parser.add_argument("--standings",  action="store_true", help="查看積分榜")
     parser.add_argument("--date",       type=str, help="台灣日期 YYYY-MM-DD")
@@ -780,6 +1171,7 @@ if __name__ == "__main__":
     if   args.predict:   cmd_predict(et_date_filter=args.date)
     elif args.today:     cmd_today(tw_date_filter=args.date)
     elif args.verify:    cmd_verify(tw_date_filter=args.date)
+    elif args.odds:      cmd_odds(tw_date_filter=args.date)
     elif args.stats:     cmd_stats()
     elif args.standings: cmd_standings(group_filter=args.group)
     else:
